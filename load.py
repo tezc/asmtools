@@ -830,7 +830,16 @@ EMBEDDED_SLOT_PREFIXES = [
 def build_slot_prefix_map_from_embedded():
     return {slot: prefix for slot, prefix in enumerate(EMBEDDED_SLOT_PREFIXES)}
 
-def load_data_to_redis(redis_client, slot_prefix_map, start_slot, end_slot, keys_per_slot=10, pipeline_batch_size=1000):
+def load_data_to_redis(
+    redis_client,
+    slot_prefix_map,
+    start_slot,
+    end_slot,
+    keys_per_slot=10,
+    pipeline_batch_size=1000,
+    data_type="string",
+    elements_per_key=10,
+):
     total_loaded = 0
 
     for slot in range(start_slot, end_slot + 1):
@@ -844,29 +853,71 @@ def load_data_to_redis(redis_client, slot_prefix_map, start_slot, end_slot, keys
 
         for i in range(keys_per_slot):
             key = f"{{{prefix}}}key{i}"
-            # Value size ratio: %80 200B, %10 500B, %10 2KB
-            rand = random.random()
-            if rand < 0.8:
-                value_size = 200
-            elif rand < 0.9:
-                value_size = 500
-            else:
-                value_size = 2048  # 2 KB
 
-            value = os.urandom(value_size)
-            pipe.set(key, value)
+            if data_type == "string":
+                # Value size ratio: %80 200B, %10 500B, %10 2KB
+                rand = random.random()
+                if rand < 0.8:
+                    value_size = 200
+                elif rand < 0.9:
+                    value_size = 500
+                else:
+                    value_size = 2048  # 2 KB
+                value = os.urandom(value_size)
+                pipe.set(key, value)
+
+            elif data_type == "hash":
+                # Use HSET to write multiple fields at once.
+                mapping = {}
+                for j in range(elements_per_key):
+                    field = f"field{j}"
+                    mapping[field] = os.urandom(200)
+                pipe.hset(key, mapping=mapping)
+
+            elif data_type == "list":
+                # Use RPUSH to push multiple elements at once.
+                values = []
+                for j in range(elements_per_key):
+                    values.append(os.urandom(200))
+                pipe.rpush(key, *values)
+
+            elif data_type == "set":
+                # Use SADD to add multiple members at once.
+                members = []
+                for j in range(elements_per_key):
+                    members.append(os.urandom(200))
+                pipe.sadd(key, *members)
+
+            elif data_type == "zset":
+                # Use ZADD to add multiple members with scores.
+                mapping = {}
+                for j in range(elements_per_key):
+                    member = os.urandom(200)
+                    score = random.uniform(0, 1000)
+                    mapping[member] = score
+                pipe.zadd(key, mapping)
+
+            elif data_type == "stream":
+                # Use XADD to add entries. Keep exactly one field per entry.
+                for j in range(elements_per_key):
+                    fields = {"v": os.urandom(200)}
+                    pipe.xadd(key, fields)
+
+            else:
+                raise ValueError(f"Unsupported data type: {data_type}")
+
             batch_counter += 1
             total_loaded += 1
 
             if batch_counter >= pipeline_batch_size:
                 pipe.execute()
-                print(f"Slot {slot} (prefix={prefix}): {batch_counter} key gönderildi.")
+                print(f"Slot {slot} (prefix={prefix}): {batch_counter} keys sent.")
                 pipe = redis_client.pipeline()
                 batch_counter = 0
 
         if batch_counter > 0:
             pipe.execute()
-            print(f"Slot {slot} (prefix={prefix}): {batch_counter} key gönderildi (son batch).")
+            print(f"Slot {slot} (prefix={prefix}): {batch_counter} keys sent (last batch).")
 
     print(f"\n{total_loaded} key loaded in total.")
 
@@ -878,6 +929,10 @@ def main():
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=6379)
     parser.add_argument("--pipeline-batch-size", type=int, default=1000)
+    parser.add_argument("--data-type", type=str, choices=["string", "hash", "list", "set", "zset", "stream"], default="string",
+                        help="Data type to write: string/hash/list/set/zset/stream")
+    parser.add_argument("--elements-per-key", type=int, default=10,
+                        help="For hash/list/set/zset/stream: number of elements per key (entries for stream); ignored for string")
 
     args = parser.parse_args()
 
@@ -890,7 +945,9 @@ def main():
         start_slot=args.start_slot,
         end_slot=args.end_slot,
         keys_per_slot=args.keys_per_slot,
-        pipeline_batch_size=args.pipeline_batch_size
+        pipeline_batch_size=args.pipeline_batch_size,
+        data_type=args.data_type,
+        elements_per_key=args.elements_per_key,
     )
 
 if __name__ == "__main__":
